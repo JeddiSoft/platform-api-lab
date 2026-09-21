@@ -5,6 +5,19 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from kubernetes import client, config
 
+from pathlib import Path
+import shutil
+
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
+from github_client import (
+    create_repository,
+    push_repository,
+    grant_team_repository_permission,
+    enroll_repository_in_governance,
+)
+from tempfile import TemporaryDirectory
+from kubernetes.client.rest import ApiException
+
 
 QUOTA_PROFILES = {
     "small": {
@@ -23,6 +36,10 @@ QUOTA_PROFILES = {
         "pods": "60"
     }
 }
+
+GITHUB_ORG = "JeddiSoft"
+
+TEMPLATES_ROOT = Path("../platform-templates")
 
 
 # ============================================================
@@ -146,6 +163,31 @@ class NamespaceRequest(BaseModel):
         "large"
     ]
 
+class ApplicationRequest(BaseModel):
+
+    application: str = Field(
+        min_length=3,
+        max_length=30,
+        description="Application name"
+    )
+
+    repository: str = Field(
+        min_length=3,
+        max_length=100,
+        description="GitHub repository name"
+    )
+
+    team: str = Field(
+        min_length=3,
+        max_length=30,
+        description="Owning team"
+    )
+
+    template: Literal[
+        "python-kubernetes"
+    ] = "python-kubernetes"
+
+
 
 # ============================================================
 # 6. AUTHENTICATION
@@ -229,6 +271,167 @@ def build_namespace_name(
 
     return f"{request.application}-{request.environment}".lower()
 
+def provision_namespace(
+    application: str,
+    team: str,
+    environment: str,
+    size: str
+):
+
+    namespace_name = f"{application}-{environment}".lower()
+    quota_profile = QUOTA_PROFILES[size]
+
+    namespace = client.V1Namespace(
+        metadata=client.V1ObjectMeta(
+            name=namespace_name,
+            labels={
+                "platform.company/application": application,
+                "platform.company/team": team,
+                "platform.company/environment": environment,
+                "platform.company/size": size,
+                "platform.company/managed-by": "platform-api"
+            }
+        )
+    )
+
+    quota = client.V1ResourceQuota(
+        metadata=client.V1ObjectMeta(
+            name="platform-quota",
+            namespace=namespace_name,
+            labels={
+                "platform.company/managed-by": "platform-api",
+                "platform.company/profile": size
+            }
+        ),
+        spec=client.V1ResourceQuotaSpec(
+            hard={
+                "requests.cpu": quota_profile["cpu"],
+                "requests.memory": quota_profile["memory"],
+                "pods": quota_profile["pods"]
+            }
+        )
+    )
+
+    try:
+        k8s.create_namespace(namespace)
+
+    except ApiException as exc:
+        if exc.status != 409:
+            raise
+
+        existing = k8s.read_namespace(namespace_name)
+
+        labels = existing.metadata.labels or {}
+
+        if labels.get("platform.company/managed-by") != "platform-api":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Namespace '{namespace_name}' already exists "
+                    "and is not managed by Platform API"
+                )
+            )
+
+    try:
+        k8s.create_namespaced_resource_quota(
+            namespace=namespace_name,
+            body=quota
+        )
+
+    except ApiException as exc:
+        if exc.status != 409:
+            raise
+
+        existing_quota = k8s.read_namespaced_resource_quota(
+            name="platform-quota",
+            namespace=namespace_name
+        )
+
+        labels = existing_quota.metadata.labels or {}
+
+        if labels.get("platform.company/managed-by") != "platform-api":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"ResourceQuota in '{namespace_name}' already exists "
+                    "and is not managed by Platform API"
+                )
+            )
+
+    return {
+        "namespace": namespace_name,
+        "size": size,
+        "quota": {
+            "cpu": quota_profile["cpu"],
+            "memory": quota_profile["memory"],
+            "pods": quota_profile["pods"]
+        }
+    }
+
+
+def render_application(
+    request: ApplicationRequest,
+    output_root: Path
+) -> Path:
+
+    template_dir = TEMPLATES_ROOT / request.template
+    output_dir = output_root / request.repository
+
+    if not template_dir.exists():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Template '{request.template}' does not exist"
+        )
+
+    if output_dir.exists():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Application '{request.repository}' already exists"
+        )
+
+    env = Environment(
+        loader=FileSystemLoader(template_dir),
+        keep_trailing_newline=True,
+        undefined=StrictUndefined
+    )
+
+    context = {
+        "application_name": request.application,
+        "repository_name": request.repository,
+        "github_org": GITHUB_ORG
+    }
+
+    try:
+
+        for source_path in template_dir.rglob("*"):
+
+            if source_path.is_dir():
+                continue
+
+            relative_path = source_path.relative_to(template_dir)
+
+            template = env.get_template(str(relative_path))
+            rendered = template.render(**context)
+
+            destination = output_dir / relative_path
+            destination.parent.mkdir(
+                parents=True,
+                exist_ok=True
+            )
+
+            destination.write_text(rendered)
+
+    except Exception:
+
+        # Avoid leaving a partially rendered application.
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+
+        raise
+
+    return output_dir
+
+
 
 # ============================================================
 # 9. HEALTH ENDPOINT
@@ -310,106 +513,99 @@ def create_namespace(
     user=Depends(require_developer)
 ):
 
-    # --------------------------------------------------------
-    # 1. Platform naming policy
-    # --------------------------------------------------------
-
-    namespace_name = build_namespace_name(request)
-
-    # --------------------------------------------------------
-    # 2. Capacity profile selected by the consumer
-    # --------------------------------------------------------
-
-    quota_profile = QUOTA_PROFILES[request.size]
-
-    # --------------------------------------------------------
-    # 3. Kubernetes Namespace object
-    # --------------------------------------------------------
-
-    namespace = client.V1Namespace(
-        metadata=client.V1ObjectMeta(
-            name=namespace_name,
-            labels={
-                "platform.company/application": request.application,
-                "platform.company/team": request.team,
-                "platform.company/environment": request.environment,
-                "platform.company/size": request.size,
-                "platform.company/managed-by": "platform-api"
-            }
-        )
+    result = provision_namespace(
+        application=request.application,
+        team=request.team,
+        environment=request.environment,
+        size=request.size
     )
 
-    try:
+    return {
+        "status": "created",
+        "namespace": result["namespace"],
+        "application": request.application,
+        "team": request.team,
+        "environment": request.environment,
+        "size": result["size"],
+        "quota": result["quota"],
+        "requested_by": user["username"]
+    }
+@app.post(
+    "/api/v1/applications",
+    status_code=status.HTTP_201_CREATED
+)
+def create_application(
+    request: ApplicationRequest,
+    user=Depends(require_developer)
+):
 
-        # ----------------------------------------------------
-        # 4. Create Namespace
-        # ----------------------------------------------------
+    with TemporaryDirectory(
+        prefix="platform-"
+    ) as temp_dir:
 
-        k8s.create_namespace(namespace)
+        output_root = Path(temp_dir)
 
-        # ----------------------------------------------------
-        # 5. Create ResourceQuota
-        #
-        # The user only selected:
-        #
-        #   size = small | medium | large
-        #
-        # The Platform API translates that into concrete
-        # Kubernetes resource limits.
-        # ----------------------------------------------------
-
-        quota = client.V1ResourceQuota(
-            metadata=client.V1ObjectMeta(
-                name="platform-quota",
-                namespace=namespace_name,
-                labels={
-                    "platform.company/managed-by": "platform-api",
-                    "platform.company/profile": request.size
-                }
-            ),
-            spec=client.V1ResourceQuotaSpec(
-                hard={
-                    "requests.cpu": quota_profile["cpu"],
-                    "requests.memory": quota_profile["memory"],
-                    "pods": quota_profile["pods"]
-                }
-            )
+        # 1. Render Golden Path
+        output_dir = render_application(
+            request,
+            output_root
         )
 
-        k8s.create_namespaced_resource_quota(
-            namespace=namespace_name,
-            body=quota
+        # 2. Provision runtime environments
+        dev_namespace = provision_namespace(
+            application=request.application,
+            team=request.team,
+            environment="dev",
+            size="small"
         )
 
-        # ----------------------------------------------------
-        # 6. API response
-        # ----------------------------------------------------
-
-        return {
-            "status": "created",
-            "namespace": namespace_name,
-            "application": request.application,
-            "team": request.team,
-            "environment": request.environment,
-            "size": request.size,
-            "quota": {
-                "cpu": quota_profile["cpu"],
-                "memory": quota_profile["memory"],
-                "pods": quota_profile["pods"]
-            },
-            "requested_by": user["username"]
-        }
-
-    except client.exceptions.ApiException as e:
-
-        if e.status == 409:
-
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Namespace or quota for '{namespace_name}' already exists"
-            )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Kubernetes API error: {e.reason}"
+        prod_namespace = provision_namespace(
+            application=request.application,
+            team=request.team,
+            environment="prod",
+            size="medium"
         )
+
+        # 3. Create GitHub repository
+        github_repository = create_repository(
+            request.repository
+        )
+
+        grant_team_repository_permission(
+            team_slug="developers",
+            repository_name=request.repository,
+            permission="push",
+        )
+
+        grant_team_repository_permission(
+            team_slug="platform-team",
+            repository_name=request.repository,
+            permission="maintain",
+        )
+
+        enroll_repository_in_governance(
+            github_repository["id"]
+        )
+
+        # 4. Bootstrap repository
+        push_repository(
+            output_dir,
+            request.repository
+        )
+
+        github_repository_url = github_repository["html_url"]
+
+    return {
+        "status": "created",
+        "application": request.application,
+        "repository": request.repository,
+        "team": request.team,
+        "template": request.template,
+        "github_org": GITHUB_ORG,
+        "github_repository": github_repository_url,
+        "namespaces": {
+            "dev": dev_namespace,
+            "prod": prod_namespace
+        },
+        "requested_by": user["username"]
+    }
